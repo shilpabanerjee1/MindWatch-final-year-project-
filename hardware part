@@ -1,0 +1,211 @@
+import numpy as np
+import glob
+import threading
+import time
+import pandas as pd
+from joblib import load
+import warnings
+warnings.filterwarnings("ignore")
+
+import board
+import busio
+
+# GSR / ADS1115
+import adafruit_ads1x15.ads1115 as ADS
+from adafruit_ads1x15.analog_in import AnalogIn
+
+# ADXL345
+import adafruit_adxl34x
+
+# MAX30102
+from max30102.heartrate_monitor import HeartRateMonitor
+
+
+# =========================
+# LOAD MODEL
+# =========================
+model = load("emotion_model_rf.joblib")
+scaler = load("scaler.joblib")
+le = load("label_encoder.joblib")
+
+feature_names = ["HR", "HRV", "EDA", "Temp", "acc_x", "acc_y", "acc_z"]
+
+# =========================
+# EMOTION MAP
+# =========================
+emotion_map = {
+    "Calm": {"valence": 0.8, "arousal": 0.3, "engagement": 0.5},
+    "Happy": {"valence": 0.9, "arousal": 0.6, "engagement": 0.7},
+    "Stress": {"valence": 0.2, "arousal": 0.9, "engagement": 0.8},
+    "Sad": {"valence": 0.1, "arousal": 0.2, "engagement": 0.3}
+}
+
+def get_suggestion(emotion):
+    if emotion == "Stress":
+        return "Take deep breaths, relax your body, and pause for a moment."
+    elif emotion == "Sad":
+        return "Talk to someone, listen to music, or take a short walk."
+    else:
+        return "You're doing well! Keep it up 👍"
+
+
+# =========================
+# TEMP SENSOR
+# =========================
+base_dir = '/sys/bus/w1/devices/'
+device_folders = glob.glob(base_dir + '28*')
+device_file = device_folders[0] + '/w1_slave' if device_folders else None
+
+def read_temp():
+    if not device_file:
+        return None, None
+    with open(device_file, 'r') as f:
+        lines = f.readlines()
+    if 'YES' not in lines[0]:
+        return None, None
+    temp_string = lines[1].split('t=')[-1]
+    temp_c = float(temp_string) / 1000.0
+    temp_f = temp_c * 9.0 / 5.0 + 32.0
+    return temp_c, temp_f
+
+
+# =========================
+# SENSOR THREAD
+# =========================
+sensor_data = {"bpm": None}
+
+class HRMonitorThread(threading.Thread):
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.hrm = HeartRateMonitor(print_raw=False, print_result=False)
+
+    def run(self):
+        global running
+        self.hrm.start_sensor()
+        try:
+            while True:
+                sensor_data["bpm"] = getattr(self.hrm, "bpm", None)
+                time.sleep(1)
+        finally:
+            self.hrm.stop_sensor()
+
+# =========================
+# MAIN
+# =========================
+def main():
+
+    print("Starting I2C...")
+    i2c = busio.I2C(board.SCL, board.SDA)
+
+    ads = ADS.ADS1115(i2c, address=0x48)
+    chan = AnalogIn(ads, 0)
+
+    accelerometer = adafruit_adxl34x.ADXL345(i2c)
+
+    # Start HR sensor
+    hr_thread = HRMonitorThread()
+    hr_thread.start()
+
+    print("🔄 Scanning for 8 seconds... Stay still")
+
+    collected = []
+    hr_history = []
+    rr_history = []
+
+    start_time = time.time()
+
+    while time.time() - start_time < 8:
+
+        # GSR
+        eda = chan.voltage
+
+        # ACC
+        acc_x, acc_y, acc_z = accelerometer.acceleration
+        norm = (acc_x**2 + acc_y**2 + acc_z**2) ** 0.5
+        if norm != 0:
+            acc_x /= norm
+            acc_y /= norm
+            acc_z /= norm
+
+        # TEMP
+        temp_c, _ = read_temp()
+
+        # HR
+        hr = sensor_data["bpm"]
+        if hr is None or temp_c is None:
+            continue
+
+        # HR smoothing
+        hr_history.append(hr)
+        if len(hr_history) > 5:
+            hr_history.pop(0)
+
+        hr_avg = sum(hr_history) / len(hr_history)
+
+        # HRV
+        rr = 60000 / hr
+        rr_history.append(rr)
+        if len(rr_history) > 10:
+            rr_history.pop(0)
+
+        if len(rr_history) >= 5:
+            base_hrv = np.std(rr_history)
+        else:
+            base_hrv = 0
+
+        # SCALE HRV (based on your dataset)
+        hrv = base_hrv * 20 + 30
+        hrv = max(25, min(hrv, 65))
+
+        collected.append([hr_avg, hrv, eda, temp_c, acc_x, acc_y, acc_z])
+
+        time.sleep(1)
+
+    # =========================
+    # AVERAGE FINAL FEATURES
+    # =========================
+    avg_features = np.mean(collected, axis=0)
+    avg_features = [float(x) for x in avg_features]
+
+    # =========================
+    # PREDICT
+    # =========================
+    X = pd.DataFrame([avg_features], columns=feature_names)
+    X_scaled = scaler.transform(X)
+
+    pred = model.predict(X_scaled)[0]
+    probs = model.predict_proba(X_scaled)[0]
+
+    emotion = le.inverse_transform([pred])[0]
+    confidence = max(probs) * 100
+
+    # Emotional index
+    valence = emotion_map[emotion]["valence"]
+    arousal = emotion_map[emotion]["arousal"]
+    engagement = emotion_map[emotion]["engagement"]
+
+    # =========================
+    # OUTPUT
+    # =========================
+    print("\n===== FINAL RESULT =====")
+    print(f"Emotion: {emotion}")
+    print(f"Confidence: {confidence:.2f}%")
+
+    print("\n--- Emotional Index ---")
+    print(f"Valence: {valence}")
+    print(f"Arousal: {arousal}")
+    print(f"Engagement: {engagement}")
+
+    print("\n--- Sensor Summary ---")
+    print(f"HR: {avg_features[0]:.2f}")
+    print(f"HRV: {avg_features[1]:.2f}")
+    print(f"EDA: {avg_features[2]:.3f}")
+    print(f"Temp: {avg_features[3]:.2f}")
+    print(f"ACC: ({avg_features[4]:.2f}, {avg_features[5]:.2f}, {avg_features[6]:.2f})")
+
+    print("\n--- Recommendation ---")
+    print(get_suggestion(emotion))
+
+
+if __name__ == "__main__":
+    main()
